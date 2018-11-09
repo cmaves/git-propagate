@@ -1,0 +1,265 @@
+#!/opt/anaconda3/bin/python3
+
+from argparse import ArgumentParser
+from concurrent.futures import ThreadPoolExecutor
+from os import environ
+from pathlib import Path
+from subprocess import CalledProcessError, run, DEVNULL, PIPE
+from sys import stderr
+
+class GitTools:
+    SUCCESS = 0
+    REPO_NOT_PRESENT = 1
+    REPO_REBASE_IN_PROGRESS = 2
+    REPO_NOT_SELECTED = 3
+    CHECKOUT_FAILED = 4
+    PATCH_DOESNT_APPLY = 5
+    PULL_FAILED = 6
+    PUSH_FAILED = 7
+
+    PATCH_FAILED = 1000
+
+    def print_statuses(self, statuses, repos=None, tabs=1):
+        if repos == None:
+            repos = self.repos
+
+        if len(statuses) != len(repos):
+            raise Exception
+
+        for i in range(len(statuses)):
+            if statuses[i] == self.SUCCESS:
+                s_str = "\033[32;1mSuccess\033[0m"
+            elif statuses[i] == self.REPO_NOT_PRESENT:
+                s_str = "\033[31;1mDirectory Missing!\033[0m"
+            elif statuses[i] == self.REPO_REBASE_IN_PROGRESS:
+                s_str = "\033[31;1mGit Rebase/AM is in Progress! (run 'git am --abort')\033[0m"
+            elif statuses[i] == self.CHECKOUT_FAILED:
+                s_str = "\033[31;1mGit Checkout Failed!\033[0m"
+            elif statuses[i] == self.PULL_FAILED:
+                s_str = "\033[31;1mGit Pull (rebase) Failed! Aborting...\033[0m"
+            elif statuses[i] == self.PUSH_FAILED:
+                s_str = "\033[31;1mGit Push Failed!\033[0m"
+            elif statuses[i] >= self.PATCH_FAILED:
+                s_str = '\033[31;1mPatch Number %d Failed! Undoing changes...\033[0m' % (statuses[i] - self.PATCH_FAILED + 1)
+            else:
+                s_str = "\033[31;1mUnknown Error!!!\033[0m"
+
+            print('\t' * tabs, repos[i], ': ', s_str, sep="", file=stderr)
+
+
+
+    def __init__(self, src, repos, verbose=False):
+        self.src = Path(src).expanduser().resolve()
+        if self.check_repo_status(self.src) == 1:
+            #TODO: real exception
+            raise Exception
+        self.repos = [Path(repo).expanduser().resolve() for repo in repos]
+        try:
+            self.repos.remove(self.src)
+        except ValueError:
+            pass
+
+        #print(repos, file=stderr)
+        self.thread_pool = ThreadPoolExecutor(max_workers=len(repos))
+        if verbose:
+            self.pipe = None
+        else:
+            self.pipe = DEVNULL
+
+        #TODO
+
+    # check if target repo exists
+    @classmethod
+    def check_repo_status(cls, repo):
+        r_path = Path(repo)
+        if not r_path.is_dir():
+            return cls.REPO_NOT_PRESENT
+        rb_path = r_path / Path('.git/rebase-apply')
+        if rb_path.is_dir():
+            return cls.REPO_REBASE_IN_PROGRESS
+        return 0
+
+    # check_repo_status() for all functions
+    def check_repos_status(self, repos=None):
+        if repos == None:
+            repos = self.repos
+        threads = self.thread_pool.map(self.check_repo_status, repos)
+        #print(threads, file=stderr)
+        return list(threads)
+
+    def checkout_branch(self, branch, repo):
+        try:
+            run(('git', 'checkout', branch), check=True, cwd=repo, stdout=self.pipe, stderr=self.pipe)
+        except CalledProcessError:
+            return self.CHECKOUT_FAILED
+        return self.SUCCESS
+
+    def checkout_branch_all(self, branch, repos=None):
+        if repos == None:
+            repos = self.repos
+        threads = self.thread_pool.map(self.checkout_branch, (branch,) * len(repos), repos)
+        return list(threads)
+
+    def pull_push(self, repo):
+        try:
+            run(('git', 'pull', '--rebase'), check=True, cwd=repo)
+            run(('git', 'push'), check=True, cwd=repo)
+        except CalledProcessError as e:
+            if e.cmd == ('git', 'pull', '--rebase'):
+                run(('git', 'rebase', '--abort'), check=True, cwd=repo)
+                return self.PULL_FAILED
+            return self.PUSH_FAILED
+        return self.SUCCESS
+
+
+    def pp_all(self, repos=None):
+        if repos == None:
+            repos = self.repos
+
+        return [self.pull_push(repo) for repo in repos]
+
+    def get_patches(self, revision, src=None):
+        #TODO: real error handling for bad result
+        if src == None:
+            src = self.src
+        d = run(('mktemp', '-d'), check=True, stdout=PIPE, universal_newlines=True).stdout[:-1]
+        run(('git', 'format-patch', '-o', d, revision), check=True, cwd=src, stderr=self.pipe)
+        return d
+
+    def apply_patches_repo(self, repo, patch_d):
+        patch_d = Path(patch_d)
+        patch_files = list(patch_d.glob('[0-9][0-9][0-9][0-9]-*.patch'))
+        patch_files.sort()
+        try:
+            for i in range(len(patch_files)):
+                run(('git', 'am', patch_files[i]), cwd=repo,  check=True, stdout=self.pipe, stderr=self.pipe)
+        except CalledProcessError as e:
+            if e.returncode == 100000:
+                raise e
+            run(('git', 'am', '--abort'), cwd=repo, stdout=self.pipe, stderr=self.pipe, check=True)
+            for n in range(i):
+                run(('git', 'reset', 'HEAD~1'), cwd=repo, stdout=self.pipe, stderr=self.pipe, check=True)
+            return self.PATCH_FAILED + i
+        return self.SUCCESS
+
+    def apply_patches_repos(self, patch_d, repos=None):
+        if repos == None:
+            repos = self.repos
+
+        threads = self.thread_pool.map(self.apply_patches_repo, repos, (patch_d,) * len(repos))
+        return list(threads)
+
+
+    def remove_bad_statuses(self, statuses):
+        #print(statuses, file=stderr)
+        if len(statuses) != len(self.repos):
+            #TODO: proper error handling
+            raise Exception
+        count = 0
+        for i in reversed(range(len(self.repos))):
+            if statuses[i] != 0:
+                self.repos.pop(i)
+                count += 1
+        return count
+
+    def sel_menu(self):
+        self.print_remaining()
+        print('----------------------------------------------------------------------')
+        print('[C]ontinue with remaining, [A]bort, or select numbers to remove (eg: 1 2 3, 1-3)?')
+        i_str = input('-->').upper().strip()
+        if len(i_str) == 0 or i_str[0] == 'C':
+            return (0,) * len(self.repos)
+        if i_str[0] =='A':
+            exit(0)
+        i_str = i_str.translate(str.maketrans(',', ' ')).split()
+        repos = set()
+        for s in i_str:
+            if '-' in s:
+                s = s.split('-', maxsplit=1)
+                start = int(s[0])
+                end = int(s[1]) + 1
+                if start < 0 or end > len(self.repos):
+                    #TODO: better error handling
+                    raise Exception
+                for i in range(start, end):
+                    repos.add(i)
+            else:
+                i = int(s)
+                if i >= len(self.repos):
+                    #TODO: better error handling
+                    raise Exception
+                repos.add(i)
+        return [self.REPO_NOT_SELECTED if i in repos else self.SUCCESS for i in range(len(self.repos))]
+
+    def print_remaining(self, tabs=1):
+        for item in enumerate(self.repos):
+            print('\t' * tabs, '\033[1m', item[0], ':\033[0m ', item[1], sep='')
+
+    def continue_or_abort(self, args, statuses, message):
+        self.print_statuses(statuses)
+        removed = self.remove_bad_statuses(statuses)
+        if len(self.repos) <= 0:
+            print('No valid repos left. Exiting...', file=stderr)
+            exit(0)
+
+        print('\n' + message, file=stderr)
+        if args.non_interactive:
+            if args.c and removed > 0:
+                print('Continuing with:')
+                self.print_remaining()
+            elif removed > 0:
+                print('A repo failed the initial status check! Exiting...', file=stderr)
+                exit(2)
+        else:
+            if args.c and removed > 0:
+                print('Continuing with:')
+                self.print_remaining()
+            else:
+                print('Select repos to continue with:')
+                self.remove_bad_statuses(self.sel_menu())
+
+
+# parse args, do interatctive stuff
+def main():
+    if 'GIT_REPOS' not in environ:
+        print('GIT_REPOS enviromental variable not set!!!', file=stderr)
+        exit(1)
+    repos = environ['GIT_REPOS'].split()
+
+    parser = ArgumentParser()
+    parser.add_argument('src')
+    parser.add_argument('revision', metavar='since|revision')
+    parser.add_argument('-n', '--non-interactive', help='Run the script in non-interactive mode',
+            action='store_true')
+    parser.add_argument('-c', action='store_true', help='In non-interactive mode the script continues with the repos that passed the first status check, instead of aborting on any failure.')
+    parser.add_argument('-b', action='store_false', help='Disables the branch checkout before applying patch')
+    parser.add_argument('-B', action='store', default='master', help='Set which branch to checkout before apply patch. Defaults to "master". Does nothing if -b is specified', metavar='branch')
+    parser.add_argument('-p', action='store_false', help='')
+    args = parser.parse_args()
+    #print(args, file=stderr)
+
+    gt = GitTools(args.src, repos)
+
+    print('generating patch for commits: %s:' % args.revision, file=stderr)
+    patch_d = gt.get_patches(args.revision)
+
+    print('checking status of target repos:', file=stderr)
+    statuses = gt.check_repos_status()
+
+    if args.b:
+        gt.continue_or_abort(args, statuses, 'checking out branches:')
+        statuses = gt.checkout_branch_all(args.B)
+
+    gt.continue_or_abort(args, statuses, 'Applying patches: %s:' % args.revision)
+    statuses = gt.apply_patches_repos(patch_d)
+
+    if args.p:
+        gt.continue_or_abort(args, statuses, 'Attempting to git pull --rebase and push changes')
+        statuses = gt.pp_all()
+        gt.print_statuses(statuses)
+
+    print('Finished, exiting', file=stderr)
+
+if __name__=="__main__":
+    main()
+
